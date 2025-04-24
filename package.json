@@ -1,0 +1,20 @@
+{
+  "name": "ocr-pipeline",
+  "version": "1.0.0",
+  "description": "OCR Pipeline for processing frames with OCR and LLM analysis",
+  "main": "sequential_ocr_processor_Reverse.js",
+  "scripts": {
+    "start": "node sequential_ocr_processor_Reverse.js",
+    "start:webhook": "./run_sequential_ocr_Reverse_Webhook.sh",
+    "start:sequential": "node process_remaining_frames_sequential.js",
+    "start:reverse": "node process_remaining_frames_reverse.js"
+  },
+  "dependencies": {
+    "airtable": "^0.11.6",
+    "dotenv": "^16.3.1"
+  },
+  "engines": {
+    "node": ">=14.0.0"
+  },
+  "private": true
+} 
