@@ -11,6 +11,7 @@ from enum import Enum
 from pydantic import BaseModel, Field, validator
 import google.generativeai as genai
 from dotenv import load_dotenv
+from PIL import Image
 
 # Configure logging
 logging.basicConfig(
@@ -66,6 +67,7 @@ class ProcessingResult(BaseModel):
     error: Optional[str] = None
     usage: Dict[str, int] = Field(default_factory=dict)
     processing_time: float = 0.0
+    model_used: Optional[str] = None
 
 class GeminiProcessor:
     """Processor class for Gemini AI operations in OCR Pipeline"""
@@ -402,7 +404,8 @@ class GeminiProcessor:
                         content=response.text,
                         error=None,
                         usage=usage,
-                        processing_time=processing_time
+                        processing_time=processing_time,
+                        model_used=model_name
                     )
                     
                 except Exception as e:
@@ -427,7 +430,8 @@ class GeminiProcessor:
             content=None,
             error=last_error,
             usage={},
-            processing_time=processing_time
+            processing_time=processing_time,
+            model_used=model
         )
     
     def process_vision(
@@ -515,13 +519,30 @@ class GeminiProcessor:
             # Calculate processing time
             processing_time = time.time() - start_time
             
+            # Log raw response for debugging
+            raw_text = response.text if hasattr(response, 'text') else str(response)
+            logger.info(f"Raw vision response (first 100 chars): {raw_text[:100]}...")
+            
+            # Check for empty response
+            if not raw_text or raw_text.strip() == "":
+                logger.error("Empty response from vision model")
+                return ProcessingResult(
+                    success=False,
+                    content="",
+                    error="Empty response from vision model",
+                    usage=usage,
+                    processing_time=processing_time,
+                    model_used=model
+                )
+            
             # Return successful result
             return ProcessingResult(
                 success=True,
-                content=response.text,
+                content=raw_text,
                 error=None,
                 usage=usage,
-                processing_time=processing_time
+                processing_time=processing_time,
+                model_used=model
             )
             
         except Exception as e:
@@ -536,7 +557,8 @@ class GeminiProcessor:
                 content=None,
                 error=error_msg,
                 usage={},
-                processing_time=processing_time
+                processing_time=processing_time,
+                model_used=model
             )
     
     def get_token_count(self, text: str, model: Optional[str] = None) -> int:
@@ -635,6 +657,150 @@ TEXT TO EXTRACT FROM:
             logger.error(f"Error parsing {structure_format}: {str(e)}")
             # Return the raw text in case caller wants to handle it
             return False, result.content
+
+    def process_image(self, image_path, prompt):
+        """
+        Process an image with the Gemini model.
+        
+        Args:
+            image_path: Path to the image file
+            prompt: Text prompt to send with the image
+            
+        Returns:
+            ProcessingResult object with the result
+        """
+        try:
+            # Check if file exists
+            if not os.path.exists(image_path):
+                return ProcessingResult(
+                    success=False,
+                    error=f"Image file not found: {image_path}",
+                    model_used=self.default_model
+                )
+            
+            # Add JSON formatting instructions to the prompt
+            enhanced_prompt = prompt
+            
+            # Ensure the prompt includes explicit JSON formatting instructions
+            if "JSON" not in prompt:
+                enhanced_prompt = prompt + "\n\nIMPORTANT: Format your response as a valid JSON object that includes 'filtered_text', 'contains_sensitive_info', and 'sensitive_content_types' fields."
+            
+            # Make sure the prompt includes a warning about formatting
+            if "DO NOT include any explanations" not in prompt:
+                enhanced_prompt += "\n\nDO NOT include any explanations, markdown formatting, or code blocks - JUST THE JSON OBJECT."
+            
+            logger.info(f"Enhanced prompt with JSON formatting instructions")
+            
+            # Directly try the Gemini 2.0 Flash Exp model which supports vision
+            vision_model = "models/gemini-2.0-flash-exp"
+            logger.info(f"Using Gemini 2.0 Flash Exp for vision: {vision_model}")
+            
+            # If that fails, we'll try these backup models in order
+            backup_models = [
+                "models/gemini-2.0-flash", 
+                "models/gemini-1.5-flash",
+                "models/gemini-1.5-pro-vision", 
+                "models/gemini-1.5-pro"
+            ]
+            
+            try:
+                # First try with the primary vision model
+                result = self.process_vision(
+                    prompt=enhanced_prompt,
+                    image_data=image_path,
+                    image_format="jpg",
+                    model=vision_model
+                )
+                
+                # If successful, return the result
+                if result.success:
+                    # Try to extract JSON from the response if needed
+                    content = result.content
+                    # Check if the response contains JSON object markers
+                    if "{" in content and "}" in content:
+                        import re
+                        json_match = re.search(r'({[\s\S]*})', content)
+                        if json_match:
+                            # Extract just the JSON part
+                            json_str = json_match.group(1)
+                            logger.info(f"Extracted JSON from response: {json_str[:100]}...")
+                            # Create a new result with the extracted JSON
+                            return ProcessingResult(
+                                success=True,
+                                content=json_str,
+                                error=None,
+                                usage=result.usage,
+                                processing_time=result.processing_time,
+                                model_used=result.model_used
+                            )
+                    
+                    return result
+                    
+                # If not successful, log the error and continue to fallbacks
+                logger.warning(f"Primary vision model {vision_model} failed: {result.error}")
+                
+                # Try backup models
+                for model in backup_models:
+                    logger.info(f"Trying backup vision model: {model}")
+                    try:
+                        result = self.process_vision(
+                            prompt=enhanced_prompt,
+                            image_data=image_path,
+                            image_format="jpg",
+                            model=model
+                        )
+                        if result.success:
+                            logger.info(f"Successfully processed with backup model: {model}")
+                            
+                            # Try to extract JSON from the response if needed
+                            content = result.content
+                            # Check if the response contains JSON object markers
+                            if "{" in content and "}" in content:
+                                import re
+                                json_match = re.search(r'({[\s\S]*})', content)
+                                if json_match:
+                                    # Extract just the JSON part
+                                    json_str = json_match.group(1)
+                                    logger.info(f"Extracted JSON from response: {json_str[:100]}...")
+                                    # Create a new result with the extracted JSON
+                                    return ProcessingResult(
+                                        success=True,
+                                        content=json_str,
+                                        error=None,
+                                        usage=result.usage,
+                                        processing_time=result.processing_time,
+                                        model_used=result.model_used
+                                    )
+                            
+                            return result
+                        else:
+                            logger.warning(f"Backup model {model} failed: {result.error}")
+                    except Exception as e:
+                        logger.warning(f"Error with backup model {model}: {str(e)}")
+                
+                # If we get here, all models failed
+                logger.error("All vision models failed")
+                return ProcessingResult(
+                    success=False,
+                    error="All vision models failed",
+                    model_used=vision_model
+                )
+                
+            except Exception as model_error:
+                logger.error(f"Error using vision models: {str(model_error)}")
+                return ProcessingResult(
+                    success=False,
+                    error=str(model_error),
+                    model_used=vision_model
+                )
+            
+        except Exception as e:
+            # Return a failure result with the error
+            return ProcessingResult(
+                success=False,
+                error=str(e),
+                model_used=self.default_model
+            )
 
 # Simple usage example
 if __name__ == "__main__":
