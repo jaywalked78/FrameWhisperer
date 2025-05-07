@@ -1,4 +1,3 @@
-    
 #!/usr/bin/env python3
 """
 Process Frames By Path - OCR and LLM Processor
@@ -33,6 +32,15 @@ from dotenv import load_dotenv
 from PIL import Image
 import google.generativeai as genai
 
+# Import the GeminiProcessor if available, otherwise use direct API calls
+try:
+    from gemini_processor import GeminiProcessor, ProcessingResult
+    GEMINI_PROCESSOR_AVAILABLE = True
+    print("Using GeminiProcessor for advanced model selection and fallbacks")
+except ImportError:
+    GEMINI_PROCESSOR_AVAILABLE = False
+    print("GeminiProcessor not found, using direct API calls")
+
 # Configure logging
 os.makedirs("logs/ocr", exist_ok=True)
 logging.basicConfig(
@@ -51,30 +59,167 @@ AIRTABLE_TOKEN = os.environ.get('AIRTABLE_PERSONAL_ACCESS_TOKEN')
 AIRTABLE_BASE_ID = os.environ.get('AIRTABLE_BASE_ID')
 AIRTABLE_TABLE_NAME = os.environ.get('AIRTABLE_TABLE_NAME', 'tblFrameAnalysis')
 
+# Global flag to control OCR-only mode (no LLM)
+# Modified to always be False - OCR Only mode disabled
+OCR_ONLY_MODE = False
+
+# Global flag to track if API validation was already successful
+API_VALIDATION_SUCCESSFUL = False
+
+# Get preferred model from environment variables
+GEMINI_PREFERRED_MODEL = os.environ.get('GEMINI_PREFERRED_MODEL', 'models/gemini-2.0-flash-exp')
+GEMINI_FALLBACK_MODELS = os.environ.get('GEMINI_FALLBACK_MODELS', 'models/gemini-2.0-flash,models/gemini-1.5-flash').split(',')
+
 # Function to validate a Gemini API key
 def validate_gemini_key(api_key):
-    """Test if a Gemini API key is valid."""
-    try:
-        genai.configure(api_key=api_key)
-        model = genai.GenerativeModel('gemini-pro')
-        response = model.generate_content("Test")
+    """Test if a Gemini API key is valid by trying different model versions."""
+    # Check if validation was already successful
+    global API_VALIDATION_SUCCESSFUL
+    if API_VALIDATION_SUCCESSFUL:
+        logger.info("Skipping API key validation as it was previously successful")
         return True
-    except Exception as e:
-        logger.warning(f"API key validation failed: {str(e)}")
+        
+    # OCR_ONLY_MODE is disabled, always validate the API key
+    logger.info("Always validating API key as OCR-ONLY mode is disabled")
+        
+    if not api_key or len(api_key) < 10:
+        logger.error("API key is empty or too short to be valid")
         return False
+        
+    # Check if the API key matches the pattern of a valid Google API key
+    import re
+    if not re.match(r'^AIza[0-9A-Za-z_-]{35}$', api_key):
+        logger.error("API key doesn't match expected Google API key format")
+        return False
+    
+    # If GeminiProcessor is available, use it for validation
+    if GEMINI_PROCESSOR_AVAILABLE:
+        try:
+            processor = GeminiProcessor(api_key=api_key, max_retries=1, allow_experimental=True)
+            models = processor.list_available_models(force_refresh=True)
+            model_count = len(models)
+            logger.info(f"✓ API key validation SUCCESSFUL using GeminiProcessor. Found {model_count} models.")
+            API_VALIDATION_SUCCESSFUL = True
+            return True
+        except Exception as e:
+            logger.error(f"❌ GeminiProcessor validation failed: {str(e)}")
+            # Fall back to direct API testing
+    
+    # Direct API testing if GeminiProcessor failed or is not available
+    # Models to try in order of preference
+    models_to_try = ['gemini-1.5-flash', 'gemini-pro']
+    
+    for model_name in models_to_try:
+        try:
+            logger.info(f"Validating API key with model: {model_name}")
+            genai.configure(api_key=api_key)
+            model = genai.GenerativeModel(model_name)
+            response = model.generate_content("Test")
+            logger.info(f"✓ API key validation SUCCESSFUL with model: {model_name}")
+            API_VALIDATION_SUCCESSFUL = True
+            return True
+        except Exception as e:
+            error_msg = str(e)
+            logger.warning(f"API key validation failed with model {model_name}: {error_msg}")
+            
+            # Check for specific error conditions
+            if "API_KEY_INVALID" in error_msg or "key expired" in error_msg:
+                logger.error(f"❌ API key is invalid or expired. Please update your API key.")
+                continue  # Try next model instead of returning immediately
+            
+            if "PERMISSION_DENIED" in error_msg:
+                logger.error(f"❌ API key doesn't have permission to access model {model_name}")
+                # Continue and try another model
+                continue
+                
+            if "RESOURCE_EXHAUSTED" in error_msg or "quota" in error_msg.lower():
+                logger.error(f"❌ API quota exceeded. Either wait or get a new API key.")
+                continue  # Try next model
+    
+    # If we get here, all models failed
+    logger.error("❌ API key validation failed with all model variants. Falling back to OCR-only mode.")
+    return False
 
 # Get Gemini API key from .env
-GEMINI_API_KEY = os.environ.get('GOOGLE_API_KEY_2')
+GEMINI_API_KEY = os.environ.get('GOOGLE_API_KEY') or os.environ.get('GEMINI_API_KEY')
 
-# If not found, use the hardcoded key we found in .env
-if not GEMINI_API_KEY:
-    GEMINI_API_KEY = "AIzaSyC3SrW9RztB4Vhilkbq_V3i1v9FDWu4z9M"
+# Log the API key (partially masked for security)
+if GEMINI_API_KEY:
+    masked_key = GEMINI_API_KEY[:6] + "..." + GEMINI_API_KEY[-4:]
+    logger.info(f"Found API key in environment: {masked_key}")
+else:
+    logger.error("No API key found in environment variables. LLM processing may fail.")
+    GEMINI_API_KEY = "" # Empty string that will cause validate_gemini_key to fail
+    logger.warning("⚠️ No API key found. Will still attempt LLM processing.")
 
-logger.info(f"Using Gemini API key: {GEMINI_API_KEY[:10]}...")
+# Reload .env file to ensure we have the latest key
+try:
+    logger.info("Attempting to reload .env file to ensure latest API key")
+    load_dotenv(override=True)
+    fresh_key = os.environ.get('GOOGLE_API_KEY') or os.environ.get('GEMINI_API_KEY')
+    if fresh_key != GEMINI_API_KEY and fresh_key:
+        logger.info(f"Updated API key found after reload! Using new key.")
+        GEMINI_API_KEY = fresh_key
+        masked_key = GEMINI_API_KEY[:6] + "..." + GEMINI_API_KEY[-4:] if GEMINI_API_KEY else "None"
+        logger.info(f"Now using API key: {masked_key}")
+except Exception as env_err:
+    logger.error(f"Error reloading .env file: {str(env_err)}")
+
+logger.info(f"Using API key: {GEMINI_API_KEY[:6] + '...' + GEMINI_API_KEY[-4:] if GEMINI_API_KEY and len(GEMINI_API_KEY) > 10 else 'None or invalid key'}")
+logger.info(f"Preferred model: {GEMINI_PREFERRED_MODEL}")
+logger.info(f"Fallback models: {GEMINI_FALLBACK_MODELS}")
+
+# Initialize GeminiProcessor if available
+gemini_processor = None
+if GEMINI_PROCESSOR_AVAILABLE and GEMINI_API_KEY:
+    try:
+        gemini_processor = GeminiProcessor(
+            api_key=GEMINI_API_KEY,
+            default_model=GEMINI_PREFERRED_MODEL,
+            allow_experimental=True,
+            max_retries=2
+        )
+        logger.info(f"Initialized GeminiProcessor with model: {GEMINI_PREFERRED_MODEL}")
+        
+        # Get model info if available
+        model_info = gemini_processor.get_model_info(GEMINI_PREFERRED_MODEL)
+        if model_info:
+            logger.info(f"Model info - Name: {model_info.name}, Generation: {model_info.generation}")
+            logger.info(f"Model capabilities - Input tokens: {model_info.input_token_limit}, Output tokens: {model_info.output_token_limit}")
+            logger.info(f"Model experimental: {model_info.is_experimental}, Preview: {model_info.is_preview}")
+    except Exception as init_err:
+        logger.error(f"Failed to initialize GeminiProcessor: {str(init_err)}")
+        logger.warning("⚠️ Will attempt to use direct API calls.")
+        gemini_processor = None
+elif not GEMINI_PROCESSOR_AVAILABLE:
+    logger.warning("GeminiProcessor module not available. Using direct API calls.")
+else:
+    logger.warning("No API key available. Direct API calls will be attempted.")
+
+# Configure Gemini for direct API calls if needed
+if GEMINI_API_KEY and not gemini_processor:
+    try:
+        genai.configure(api_key=GEMINI_API_KEY)
+        logger.info(f"Configured Gemini with API key for direct API calls")
+    except Exception as config_err:
+        logger.error(f"Error configuring Gemini API: {str(config_err)}")
+        logger.warning("⚠️ Will continue attempting to use LLM processing despite configuration error.")
     
-# Configure Gemini
-genai.configure(api_key=GEMINI_API_KEY)
-logger.info(f"Configured Gemini with API key")
+# Validate the API key
+try:
+    is_valid = validate_gemini_key(GEMINI_API_KEY)
+    if not is_valid:
+        logger.error("Invalid or missing Gemini API key. Processing may fail.")
+        logger.warning("⚠️ Invalid API key, but continuing with LLM processing as OCR-ONLY mode is disabled.")
+    else:
+        logger.info("✓ API key validation passed. Full OCR+LLM processing will be performed.")
+        
+        # Environment setting for OCR_ONLY_MODE is ignored
+        if os.environ.get('OCR_ONLY_MODE', '').lower() in ('true', '1', 'yes'):
+            logger.info("OCR_ONLY_MODE found in environment but ignored as per configuration.")
+except Exception as validate_err:
+    logger.error(f"Error during API key validation: {str(validate_err)}")
+    logger.warning("⚠️ Will continue attempting to use LLM processing despite validation error.")
 
 # Simplify for now - no key rotation
 GEMINI_USE_KEY_ROTATION = False
@@ -412,17 +557,27 @@ class FrameProcessor:
         Args:
             use_key_rotation: Whether to use API key rotation (currently disabled)
         """
-        # Initialize Tesseract OCR
-        from pytesseract import pytesseract
+        import pytesseract
         self.pytesseract = pytesseract
         
-        # Initialize Gemini model with the configured API key
-        self.model = genai.GenerativeModel('gemini-1.5-flash')
-        logger.info("Initialized frame processor with Tesseract OCR and Gemini 1.5 Flash")
+        # Initialize Gemini processor
+        global gemini_processor
+        self.gemini_processor = gemini_processor
+        
+        # Initialize direct API model as fallback
+        if not self.gemini_processor:
+            try:
+                self.model = genai.GenerativeModel(GEMINI_PREFERRED_MODEL)
+                logger.info(f"Initialized frame processor with Tesseract OCR and model {GEMINI_PREFERRED_MODEL}")
+            except Exception as e:
+                logger.error(f"Failed to initialize Gemini model: {str(e)}")
+                logger.warning("⚠️ Will continue attempting to use LLM processing")
+        else:
+            logger.info(f"Initialized frame processor with Tesseract OCR and GeminiProcessor")
     
     async def extract_text(self, image_path: str) -> str:
         """
-        Extract text from an image using OCR.
+        Extract text from an image using OCR with enhanced configuration options.
         
         Args:
             image_path: Path to the image file
@@ -433,23 +588,72 @@ class FrameProcessor:
         try:
             # Check if file exists
             if not os.path.exists(image_path):
-                logger.error(f"Image file not found: {image_path}")
+                logger.error(f"OCR ERROR: Image file not found: {image_path}")
                 return ""
                 
             # Open the image file
-            img = Image.open(image_path)
+            try:
+                img = Image.open(image_path)
+                logger.info(f"OCR image loaded: {image_path} - Size: {img.size}, Mode: {img.mode}")
+            except Exception as img_err:
+                logger.error(f"OCR ERROR: Failed to open image: {str(img_err)}")
+                return ""
             
-            # Use Tesseract to extract text
-            ocr_text = await asyncio.to_thread(
-                self.pytesseract.image_to_string,
-                img,
-                lang='eng',
-                config='--psm 6'
-            )
+            # Try multiple OCR configurations to maximize text detection
+            ocr_results = []
+            ocr_configs = [
+                # Default configuration with page segmentation mode 6 (assume a single uniform block of text)
+                {'config': '--psm 6', 'description': 'Default-PSM6'},
+                
+                # Try page segmentation mode 4 (assume a single column of text)
+                {'config': '--psm 4', 'description': 'Single-column-PSM4'},
+                
+                # Try page segmentation mode 3 (fully automatic page segmentation, but no OSD)
+                {'config': '--psm 3', 'description': 'Auto-PSM3'},
+                
+                # Try with different image processing (improve contrast)
+                {'config': '--psm 6 -c preserve_interword_spaces=1', 'description': 'Preserve-spaces'}
+            ]
             
-            return ocr_text.strip()
+            # Process with each configuration
+            for config in ocr_configs:
+                try:
+                    logger.debug(f"Trying OCR config: {config['description']}")
+                    ocr_text = await asyncio.to_thread(
+                        self.pytesseract.image_to_string,
+                        img,
+                        lang='eng',
+                        config=config['config']
+                    )
+                    
+                    ocr_text = ocr_text.strip()
+                    if ocr_text:
+                        logger.debug(f"OCR config {config['description']} found {len(ocr_text)} chars")
+                        ocr_results.append(ocr_text)
+                except Exception as config_err:
+                    logger.warning(f"OCR ERROR with config {config['description']}: {str(config_err)}")
+            
+            # Choose the best result (the one with most characters)
+            if ocr_results:
+                best_result = max(ocr_results, key=len)
+                char_count = len(best_result)
+                word_count = len(best_result.split())
+                logger.info(f"Best OCR result: {char_count} chars, ~{word_count} words")
+                
+                # Log a preview of the detected text
+                preview = best_result[:100] + "..." if len(best_result) > 100 else best_result
+                logger.info(f"OCR text preview: {preview}")
+                
+                return best_result
+            else:
+                logger.warning(f"No text extracted from image with any OCR configuration: {image_path}")
+                return ""
+                
         except Exception as e:
-            logger.error(f"Error extracting text from image {image_path}: {e}")
+            logger.error(f"OCR ERROR: Unhandled exception extracting text from {image_path}: {e}")
+            if hasattr(e, "__traceback__"):
+                import traceback
+                logger.error(f"OCR Traceback: {traceback.format_exc()}")
             return ""
     
     async def process_with_llm(self, image_path: str, ocr_text: str) -> Dict[str, Any]:
@@ -463,56 +667,80 @@ class FrameProcessor:
         Returns:
             Dictionary with LLM analysis results
         """
+        # OCR-only mode is disabled, always try LLM processing
+        logger.info(f"Processing {os.path.basename(image_path)} with LLM")
+            
         try:
             if not os.path.exists(image_path):
-                logger.error(f"Image file not found for LLM processing: {image_path}")
+                logger.error(f"ERROR_STAGE_1: Image file not found for LLM processing: {image_path}")
                 return {
-                    "filtered_text": "No readable text",
+                    "filtered_text": "ERROR_STAGE_1: Image file not found",
                     "contains_sensitive_info": False,
                     "processing_error": True
                 }
             
-            # Load the image
-            img = Image.open(image_path)
+            # Log OCR text for debugging
+            if ocr_text:
+                logger.info(f"OCR Text (first 100 chars): {ocr_text[:100]}")
+            else:
+                logger.warning(f"Empty OCR text for image: {image_path}")
             
-            # Prepare the prompt for Gemini with clear schema and examples
+            # Load the image
+            try:
+                img = Image.open(image_path)
+                logger.info(f"Image loaded successfully: {image_path} - Size: {img.size}")
+            except Exception as img_err:
+                logger.error(f"ERROR_STAGE_2: Failed to load image: {str(img_err)}")
+                return {
+                    "filtered_text": "ERROR_STAGE_2: Failed to load image",
+                    "contains_sensitive_info": False,
+                    "processing_error": True
+                }
+            
+            # Prepare the prompt for Gemini with clearer instructions and examples
             prompt = f"""
             Analyze this screen capture with the OCR text.
             
             OCR Text: {ocr_text}
             
             Your task:
-            1. Extract only the meaningful text that was actually on the screen
-            2. Ignore garbled text, OCR errors, and random artifacts
-            3. Determine if the frame contains sensitive information
+            1. Extract all meaningful text visible in the image
+            2. You MUST try to identify words and labels even if the OCR text is incomplete or garbled
+            3. If there are menus, buttons, or UI elements with text, include them
+            4. Remove OCR errors and random artifacts
+            5. Flag any sensitive information (passwords, API keys, credentials, personal data)
+            6. IMPORTANT: NEVER return "No readable text" unless the image truly has NO text at all
+            7. Even partial or single words are better than returning "No readable text"
+            8. Organize text with category labels like "UI:", "Content:", "Menu:" etc. followed by text
+            9. Use pipe symbols (|) to separate different UI elements and sections
             
             RESPONSE FORMAT:
             You must respond EXCLUSIVELY with a valid JSON object that follows this exact schema:
             {{
-                "filtered_text": string,  // The cleaned text from the screen or exactly "No readable text" if none found
+                "filtered_text": string,  // ALL text found in the image, formatted with sections and separators
                 "contains_sensitive_info": boolean,  // Must be exactly true or false
                 "sensitive_content_types": string[]  // Array of strings, empty if no sensitive info
             }}
             
             EXAMPLES:
             
-            Example 1 (No sensitive info):
+            Example 1 (UI elements):
             {{
-                "filtered_text": "Home page - Dashboard - User settings",
+                "filtered_text": "App: Firefox | Time: 3:45 PM | UI: Home | Dashboard | Settings | Profile | Logout | Section: Search... | Content: Recent Activity: No new notifications",
                 "contains_sensitive_info": false,
                 "sensitive_content_types": []
             }}
             
             Example 2 (With sensitive info):
             {{
-                "filtered_text": "API Key: sk_test_EXAMPLE_KEY_PLACEHOLDER",
+                "filtered_text": "Page: Settings | Section: API Configuration | Key: sk_test_EXAMPLE_KEY_PLACEHOLDER | User: admin@example.com",
                 "contains_sensitive_info": true,
-                "sensitive_content_types": ["api_key"]
+                "sensitive_content_types": ["api_key", "email"]
             }}
             
-            Example 3 (No readable text):
+            Example 3 (Even with partial text):
             {{
-                "filtered_text": "No readable text",
+                "filtered_text": "App: Dashboard | Status: Online | Config: System Options | Menu: File | Edit | View",
                 "contains_sensitive_info": false,
                 "sensitive_content_types": []
             }}
@@ -520,36 +748,131 @@ class FrameProcessor:
             DO NOT include any explanations, markdown formatting, or code blocks - JUST THE JSON OBJECT.
             """
             
-            # Call Gemini with the image and prompt
-            response = await asyncio.to_thread(
-                self.model.generate_content,
-                [prompt, img]
-            )
+            # Process with GeminiProcessor if available
+            if self.gemini_processor:
+                try:
+                    logger.info(f"Processing with GeminiProcessor for image: {os.path.basename(image_path)}")
+                    result = await asyncio.to_thread(
+                        self.gemini_processor.process_image_with_text,
+                        image_path=image_path,
+                        prompt=prompt
+                    )
+                    
+                    if result.success:
+                        logger.info(f"GeminiProcessor success with model: {result.model_used}")
+                        try:
+                            # Parse the JSON response
+                            result_json = json.loads(result.content)
+                            logger.info(f"Successfully parsed JSON response from GeminiProcessor")
+                            return result_json
+                        except json.JSONDecodeError as json_err:
+                            logger.error(f"Failed to parse GeminiProcessor JSON response: {str(json_err)}")
+                            # Continue to direct API as fallback
+                    else:
+                        logger.error(f"GeminiProcessor failed: {result.error}")
+                        # Continue to direct API as fallback
+                except Exception as processor_err:
+                    logger.error(f"GeminiProcessor error: {str(processor_err)}")
+                    # Continue to direct API as fallback
+            
+            # If GeminiProcessor failed or isn't available, use direct API
+            logger.info(f"Calling Gemini API directly for image: {os.path.basename(image_path)}")
+            try:
+                model = getattr(self, 'model', None)
+                if not model:
+                    # If model not initialized, create one now
+                    model = genai.GenerativeModel(GEMINI_PREFERRED_MODEL)
+                    
+                response = await asyncio.to_thread(
+                    model.generate_content,
+                    [prompt, img]
+                )
+                logger.info(f"Gemini API call successful with model {GEMINI_PREFERRED_MODEL}")
+            except Exception as api_err:
+                logger.error(f"ERROR_STAGE_3: Gemini API call failed: {str(api_err)}")
+                # Try fallback models before giving up
+                fallback_success = False
+                for fallback_model in GEMINI_FALLBACK_MODELS:
+                    try:
+                        logger.info(f"Trying fallback model: {fallback_model}")
+                        fallback = genai.GenerativeModel(fallback_model)
+                        response = await asyncio.to_thread(
+                            fallback.generate_content,
+                            [prompt, img]
+                        )
+                        logger.info(f"Fallback to {fallback_model} succeeded")
+                        fallback_success = True
+                        break
+                    except Exception as fallback_err:
+                        logger.error(f"Fallback to {fallback_model} failed: {str(fallback_err)}")
+                        continue
+                
+                if not fallback_success:
+                    # Fall back to OCR-only mode if all API calls fail
+                    logger.warning(f"⚠️ Falling back to OCR-only mode for this frame due to API error")
+                    return {
+                        "filtered_text": ocr_text if ocr_text else f"ERROR_STAGE_3: Gemini API call failed and no OCR text available",
+                        "contains_sensitive_info": False,
+                        "processing_error": True,
+                        "ocr_only_mode": True
+                    }
             
             # Parse the response
-            text = response.text
-            # Extract JSON part
-            if "```json" in text:
-                json_str = text.split("```json")[1].split("```")[0].strip()
-            elif "```" in text:
-                json_str = text.split("```")[1].strip()
-            else:
-                json_str = text.strip()
-            
-            result = json.loads(json_str)
-            
-            # Ensure "No readable text" is used when appropriate
-            if not result.get("filtered_text") or result.get("filtered_text").strip() == "":
-                result["filtered_text"] = "No readable text"
+            try:
+                text = response.text
+                logger.debug(f"Raw response (truncated): {text[:200]}...")
                 
+                # Extract JSON part
+                if "```json" in text:
+                    json_str = text.split("```json")[1].split("```")[0].strip()
+                    logger.debug("JSON extracted from markdown code block with json language specified")
+                elif "```" in text:
+                    json_str = text.split("```")[1].strip()
+                    logger.debug("JSON extracted from generic markdown code block")
+                else:
+                    json_str = text.strip()
+                    logger.debug("Using raw response as JSON")
+                
+                result = json.loads(json_str)
+                logger.info(f"Successfully parsed JSON response")
+            except Exception as parse_err:
+                logger.error(f"ERROR_STAGE_4: Failed to parse Gemini response: {str(parse_err)}")
+                logger.error(f"Raw response was: {text[:500]}...")
+                # Fall back to OCR-only mode
+                logger.warning(f"⚠️ Falling back to OCR-only mode for this frame due to parsing error")
+                return {
+                    "filtered_text": ocr_text if ocr_text else f"ERROR_STAGE_4: Failed to parse response and no OCR text available",
+                    "contains_sensitive_info": False,
+                    "processing_error": True,
+                    "ocr_only_mode": True
+                }
+            
+            # Validate result content
+            if not result.get("filtered_text") or result.get("filtered_text").strip() == "":
+                logger.warning(f"Model returned empty filtered_text for {image_path}")
+                result["filtered_text"] = "No readable text (Empty model response)"
+            elif result.get("filtered_text").strip() == "No readable text" and ocr_text and len(ocr_text.strip()) > 20:
+                logger.warning(f"Model returned 'No readable text' but OCR found {len(ocr_text.strip())} chars of text")
+                # Include a sample of the OCR text in the result for debugging
+                result["filtered_text"] = f"POSSIBLE OCR MISMATCH: Model found no text, but OCR found: {ocr_text[:100]}"
+                
+            # Log successful processing
+            logger.info(f"Completed LLM processing for {image_path} - Found text: {result.get('filtered_text', '')[:50]}...")
             return result
             
         except Exception as e:
-            logger.error(f"Error processing {image_path} with Gemini: {e}")
+            error_message = f"ERROR_STAGE_5: Unhandled error processing {image_path}: {str(e)}"
+            logger.error(error_message)
+            if hasattr(e, "__traceback__"):
+                import traceback
+                logger.error(f"Traceback: {traceback.format_exc()}")
+            
+            # Fall back to OCR text in case of any error
             return {
-                "filtered_text": "No readable text",
+                "filtered_text": ocr_text if ocr_text else error_message,
                 "contains_sensitive_info": False,
-                "processing_error": True
+                "processing_error": True,
+                "ocr_only_mode": True
             }
 
 
@@ -572,6 +895,13 @@ class FrameProcessorByPath:
         # Ensure OCR results directory exists
         os.makedirs(OCR_RESULTS_DIR, exist_ok=True)
         logger.info(f"Initialized FrameProcessorByPath with batch size {batch_size}")
+        
+        # Report on GeminiProcessor status
+        if self.frame_processor.gemini_processor:
+            logger.info(f"Using GeminiProcessor with preferred model: {GEMINI_PREFERRED_MODEL}")
+            logger.info(f"Fallback models configured: {GEMINI_FALLBACK_MODELS}")
+        else:
+            logger.info(f"Using direct API with model: {GEMINI_PREFERRED_MODEL}")
     
     async def process_single_frame(self, folder_path: str) -> Dict[str, Any]:
         """
@@ -584,9 +914,11 @@ class FrameProcessorByPath:
             Dictionary with processing results
         """
         try:
-            logger.info(f"Processing single frame: {folder_path}")
+            logger.info(f"============ PROCESSING FRAME: {folder_path} ============")
+            start_time = time.time()
             
             # Find the record in Airtable
+            logger.info(f"Step 1: Finding Airtable record for path")
             records = await self.airtable.find_records_by_folder_path(folder_path)
             
             if not records:
@@ -599,26 +931,59 @@ class FrameProcessorByPath:
             
             record = records[0]  # Take the first matching record
             record_id = record['id']
+            logger.info(f"Found Airtable record: {record_id}")
             
             # Extract text with OCR
+            logger.info(f"Step 2: Extracting text with OCR")
+            ocr_start_time = time.time()
             ocr_text = await self.frame_processor.extract_text(folder_path)
+            ocr_time = time.time() - ocr_start_time
+            
+            ocr_stats = {
+                "chars": len(ocr_text) if ocr_text else 0,
+                "words": len(ocr_text.split()) if ocr_text else 0,
+                "time_seconds": round(ocr_time, 2)
+            }
             
             if not ocr_text:
                 logger.warning(f"No OCR text extracted from {folder_path}")
+            else:
+                logger.info(f"OCR completed in {ocr_stats['time_seconds']}s, found {ocr_stats['chars']} chars, {ocr_stats['words']} words")
                 
             # Process with LLM
+            logger.info(f"Step 3: Processing with LLM")
+            llm_start_time = time.time()
             llm_result = await self.frame_processor.process_with_llm(folder_path, ocr_text)
+            llm_time = time.time() - llm_start_time
             
-            # Prepare OCR data summary
+            filtered_text = llm_result.get("filtered_text", "No readable text")
+            
+            # Generate processing stats for diagnostic purposes
+            llm_stats = {
+                "chars": len(filtered_text) if filtered_text else 0,
+                "words": len(filtered_text.split()) if filtered_text else 0,
+                "time_seconds": round(llm_time, 2),
+                "contains_sensitive_info": llm_result.get("contains_sensitive_info", False)
+            }
+            
+            logger.info(f"LLM completed in {llm_stats['time_seconds']}s, extracted {llm_stats['chars']} chars, {llm_stats['words']} words")
+            
+            # Prepare OCR data summary with added diagnostic information
             ocr_summary = {
                 "processed_at": datetime.datetime.now().isoformat(),
                 "status": "processed",
                 "ocr_text": llm_result.get("filtered_text", "No readable text"),
                 "contains_sensitive_info": llm_result.get("contains_sensitive_info", False),
-                "sensitive_content_types": llm_result.get("sensitive_content_types", [])
+                "sensitive_content_types": llm_result.get("sensitive_content_types", []),
+                "processing_stats": {
+                    "ocr": ocr_stats,
+                    "llm": llm_stats,
+                    "total_time_seconds": round(time.time() - start_time, 2)
+                }
             }
             
             # Save OCR result as JSON file
+            logger.info(f"Step 4: Saving results to JSON")
             frame_name = os.path.basename(folder_path)
             frame_id = os.path.splitext(frame_name)[0]
             json_path = os.path.join(OCR_RESULTS_DIR, f"{frame_id}.json")
@@ -629,12 +994,14 @@ class FrameProcessorByPath:
                     "frame_name": frame_name,
                     "airtable_id": record_id,
                     "ocr_data": ocr_summary,
-                    "processed_at": datetime.datetime.now().isoformat()
+                    "processed_at": datetime.datetime.now().isoformat(),
+                    "raw_ocr_text": ocr_text[:500] + "..." if len(ocr_text) > 500 else ocr_text  # Save original OCR for debugging
                 }, f, indent=2)
             
             logger.info(f"Saved OCR result to {json_path}")
             
             # Update Airtable record
+            logger.info(f"Step 5: Updating Airtable record")
             sensitive_flag = llm_result.get("contains_sensitive_info", False)
             # Set Flagged field to simple boolean string
             sensitive_flag_value = 'true' if sensitive_flag else 'false'
@@ -643,7 +1010,8 @@ class FrameProcessorByPath:
             filtered_text = llm_result.get("filtered_text", "No readable text")
             update_data = {
                 "OCRData": filtered_text,
-                "Flagged": sensitive_flag_value
+                "Flagged": sensitive_flag_value,
+                "ProcessingTime": str(round(time.time() - start_time, 2)) + "s"  # Store processing time in Airtable
             }
             
             # Add detailed sensitivity information to SensitivityConcerns field if sensitive
@@ -656,11 +1024,19 @@ class FrameProcessorByPath:
             
             if success:
                 logger.info(f"Successfully updated Airtable record for {frame_name}")
+                
+                # Include processing stats in the result
+                total_time = time.time() - start_time
+                logger.info(f"============ FRAME PROCESSING COMPLETED in {round(total_time, 2)}s ============")
+                
                 return {
                     "status": "success",
                     "folder_path": folder_path,
                     "record_id": record_id,
-                    "sensitive": sensitive_flag
+                    "sensitive": sensitive_flag,
+                    "processing_time": round(total_time, 2),
+                    "char_count": llm_stats["chars"],
+                    "had_ocr_text": ocr_stats["chars"] > 0
                 }
             else:
                 logger.error(f"Failed to update Airtable record for {frame_name}")
@@ -673,6 +1049,9 @@ class FrameProcessorByPath:
                 
         except Exception as e:
             logger.error(f"Error processing frame {folder_path}: {e}")
+            if hasattr(e, "__traceback__"):
+                import traceback
+                logger.error(f"Frame processing traceback: {traceback.format_exc()}")
             return {
                 "status": "error",
                 "error": str(e),
@@ -954,11 +1333,28 @@ async def main():
                       help="Path to a file containing specific record IDs to process (one per line)")
     parser.add_argument("--skip-airtable-update", action="store_true",
                       help="Skip updating Airtable records (results will be saved to JSON files only)")
+    parser.add_argument("--model",
+                      help="Specify a Gemini model to use (default: from env or gemini-2.0-flash-exp)")
     
     args = parser.parse_args()
     
     if not args.folder_path and not args.folder_path_pattern and not args.specific_ids:
         parser.error("Either --folder-path, --folder-path-pattern, or --specific-ids must be provided")
+    
+    # Handle model override
+    if args.model:
+        global GEMINI_PREFERRED_MODEL
+        GEMINI_PREFERRED_MODEL = args.model
+        logger.info(f"Using command-line specified model: {GEMINI_PREFERRED_MODEL}")
+        
+        # Reinitialize processor with new model if needed
+        global gemini_processor
+        if gemini_processor:
+            try:
+                gemini_processor.default_model = GEMINI_PREFERRED_MODEL
+                logger.info(f"Updated GeminiProcessor to use model: {GEMINI_PREFERRED_MODEL}")
+            except Exception as model_err:
+                logger.error(f"Error updating model: {str(model_err)}")
     
     try:
         # Initialize processor

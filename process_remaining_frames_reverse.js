@@ -65,28 +65,81 @@ function validateConfig() {
     process.exit(1);
   }
   
-  // Check for Gemini API keys
-  let geminiKeyCount = 0;
+  // Check for available API keys - prioritize Gemini keys
+  const apiKeys = {
+    gemini: [],
+    google: process.env.GOOGLE_API_KEY
+  };
+  
+  // Check for Gemini API keys in rotational format
   for (let i = 1; i <= 5; i++) {
     if (process.env[`GEMINI_API_KEY_${i}`]) {
-      geminiKeyCount++;
+      apiKeys.gemini.push(process.env[`GEMINI_API_KEY_${i}`]);
     }
   }
   
-  if (geminiKeyCount === 0) {
-    log('Warning: No GEMINI_API_KEY_n variables found. Key rotation won\'t be available.');
-    if (!process.env.GEMINI_API_KEY) {
-      log('Error: No GEMINI_API_KEY found either. Processing will likely fail.');
+  // Also check for a single non-rotational GEMINI_API_KEY
+  if (process.env.GEMINI_API_KEY) {
+    apiKeys.gemini.unshift(process.env.GEMINI_API_KEY);
+  }
+  
+  // Configure environment based on available keys
+  if (apiKeys.gemini.length > 0) {
+    log(`Found ${apiKeys.gemini.length} Gemini API keys available for use`);
+    
+    // Set up the first key as main key if no rotation is needed or available
+    if (apiKeys.gemini.length === 1 || MAX_WORKERS === 1) {
+      process.env.GEMINI_API_KEY = apiKeys.gemini[0];
+      log(`Using single Gemini API key: ${apiKeys.gemini[0].substring(0, 10)}...`);
+      process.env.GEMINI_USE_KEY_ROTATION = 'false';
+    } else {
+      // Set up rotation for multiple workers
+      apiKeys.gemini.forEach((key, index) => {
+        process.env[`GEMINI_API_KEY_${index+1}`] = key;
+      });
+      log(`Configured ${apiKeys.gemini.length} Gemini API keys for rotation`);
+      process.env.GEMINI_USE_KEY_ROTATION = 'true';
+    }
+  } 
+  // Fall back to Google API key if no Gemini keys are found
+  else if (apiKeys.google) {
+    log(`No Gemini API keys found, using Google API key as fallback: ${apiKeys.google.substring(0, 10)}...`);
+    process.env.GEMINI_API_KEY = apiKeys.google;
+    process.env.GEMINI_USE_KEY_ROTATION = 'false';
+    
+    // If we have multiple workers but only one key, we need to add rate limiting
+    if (MAX_WORKERS > 1) {
+      process.env.GEMINI_RATE_LIMIT = '20'; // Lower limit for single key with multiple workers
+      process.env.GEMINI_COOLDOWN_PERIOD = '90'; // Longer cooldown for single key with multiple workers
+      log(`Configured rate limiting for single API key with multiple workers`);
     }
   } else {
-    log(`Found ${geminiKeyCount} Gemini API keys available for rotation`);
+    log(`Warning: No API keys found. Processing will attempt to continue with LLM processing.`);
+    // OCR_ONLY_MODE is no longer used - we always attempt LLM processing
   }
+  
+  // Check/set preferred model configuration
+  if (process.env.GEMINI_PREFERRED_MODEL) {
+    log(`Using preferred Gemini model: ${process.env.GEMINI_PREFERRED_MODEL}`);
+  } else {
+    // Set default preferred model to Gemini 2.0 Flash experimental
+    process.env.GEMINI_PREFERRED_MODEL = 'models/gemini-2.0-flash-exp';
+    log(`Setting default preferred model to ${process.env.GEMINI_PREFERRED_MODEL}`);
+  }
+  
+  // Configure fallback models
+  process.env.GEMINI_FALLBACK_MODELS = process.env.GEMINI_FALLBACK_MODELS || 'models/gemini-2.0-flash,models/gemini-1.5-flash';
+  log(`Configured fallback models: ${process.env.GEMINI_FALLBACK_MODELS}`);
+  
+  // Always use maximum available workers since we always attempt LLM processing
+  const optimalWorkers = Math.min(MAX_WORKERS, Math.max(1, apiKeys.gemini.length || 1));
+  log(`Using ${optimalWorkers} worker(s) for processing`);
   
   const trackingTable = process.env.AIRTABLE_TRACKING_TABLE || 'Finished OCR Processed Folders';
   const folderNameField = process.env.FOLDER_NAME_FIELD || 'FolderName';
   const tableName = process.env.AIRTABLE_TABLE_NAME || 'tblFrameAnalysis';
   
-  return { trackingTable, folderNameField, tableName, geminiKeyCount };
+  return { trackingTable, folderNameField, tableName, optimalWorkers };
 }
 
 // Fetch finished folders from Airtable
@@ -327,68 +380,54 @@ async function createBatchFiles(framesFile, totalFrames, numWorkers) {
   }
 }
 
-// Run worker process with proper API key rotation
+// Run worker process to handle one batch of frames
 function runWorker(batchFile, workerId, tableName) {
-  return new Promise((resolve) => {
-    log(`Starting worker ${workerId} for ${batchFile.frameCount} frames`);
+  return new Promise(resolve => {
+    log(`Starting worker ${workerId} with batch: ${path.basename(batchFile)}`);
     
-    // Determine which API key to use - use rotation pattern with staggered start times
-    const keyIndex = ((workerId - 1) % 5) + 1;
-    const apiKeyName = `GEMINI_API_KEY_${keyIndex}`;
+    // Build command with all necessary parameters
+    const workerCmd = 'node';
+    const workerArgs = [
+      'robust_ocr_worker.js',
+      `--frames-file=${batchFile}`,
+      `--worker-id=${workerId}`,
+      `--api-key=${process.env.AIRTABLE_PERSONAL_ACCESS_TOKEN}`,
+      `--base-id=${process.env.AIRTABLE_BASE_ID}`,
+      `--table-name=${tableName}`,
+      '--timeout=300',
+      '--max-retries=3',
+      `--model=${process.env.GEMINI_PREFERRED_MODEL || 'models/gemini-2.0-flash-exp'}`,
+      `--fallback-models=${process.env.GEMINI_FALLBACK_MODELS || 'models/gemini-2.0-flash,models/gemini-1.5-flash'}`
+    ];
     
-    // Stagger worker start times to avoid hitting API rate limits simultaneously
-    const staggerDelay = (workerId - 1) * 10000; // 10 second delay between workers
+    log(`Worker ${workerId} command: ${workerCmd} ${workerArgs.join(' ')}`);
     
-    log(`Worker ${workerId} will start in ${staggerDelay/1000} seconds (using key: ${apiKeyName})`);
+    // Clone environment and set needed variables
+    const env = Object.assign({}, process.env);
     
-    setTimeout(() => {
-      // Build command with all necessary parameters
-      const workerCmd = 'node';
-      const workerArgs = [
-        'robust_ocr_worker.js',
-        `--frames-file=${batchFile.file}`,
-        `--worker-id=${workerId}`,
-        `--api-key=${process.env.AIRTABLE_PERSONAL_ACCESS_TOKEN}`,
-        `--base-id=${process.env.AIRTABLE_BASE_ID}`,
-        `--table-name=${tableName}`,
-        '--timeout=300',
-        '--max-retries=3'
-      ];
-      
-      log(`Worker ${workerId} command: ${workerCmd} ${workerArgs.join(' ')}`);
-      log(`Worker ${workerId} will use key: ${apiKeyName} = ${process.env[apiKeyName] ? process.env[apiKeyName].substring(0, 8) + '...' : 'NOT SET'}`);
-      
-      // Set environment variables for child process
-      const env = Object.assign({}, process.env);
-      
-      // Explicitly set the selected API key as GEMINI_API_KEY
-      if (process.env[apiKeyName]) {
-        env.GEMINI_API_KEY = process.env[apiKeyName];
-        env.GEMINI_USE_KEY_ROTATION = 'true';
-        
-        // Add rate limit configuration to avoid quota errors
-        env.GEMINI_RATE_LIMIT = '30'; // Limit to 30 requests per minute
-        env.GEMINI_COOLDOWN_PERIOD = '60'; // 60 second cooldown
-      }
-      
-      // Start the worker process
-      const worker = spawn(workerCmd, workerArgs, {
-        env,
-        stdio: 'inherit' // Redirect worker output to this process
-      });
-      
-      log(`Worker ${workerId} started with PID: ${worker.pid}`);
-      
-      worker.on('close', (code) => {
-        log(`Worker ${workerId} exited with code: ${code}`);
-        resolve(code);
-      });
-      
-      worker.on('error', (error) => {
-        log(`Worker ${workerId} error: ${error.message}`);
-        resolve(1); // Error exit code
-      });
-    }, staggerDelay);
+    // Remove OCR_ONLY_MODE from environment if set (since we're disabling it)
+    if (env.OCR_ONLY_MODE) {
+      log(`Note: OCR_ONLY_MODE setting will be ignored for worker ${workerId} as this mode has been disabled.`);
+      delete env.OCR_ONLY_MODE;
+    }
+    
+    // Start the worker process
+    const worker = spawn(workerCmd, workerArgs, {
+      env,
+      stdio: 'inherit' // Redirect worker output to this process
+    });
+    
+    log(`Worker ${workerId} started with PID: ${worker.pid}`);
+    
+    worker.on('close', (code) => {
+      log(`Worker ${workerId} exited with code: ${code}`);
+      resolve(code);
+    });
+    
+    worker.on('error', (error) => {
+      log(`Worker ${workerId} error: ${error.message}`);
+      resolve(1); // Error exit code
+    });
   });
 }
 
@@ -414,11 +453,11 @@ async function runWorkers(batchFiles, tableName) {
 // Main execution function
 async function main() {
   // Validate configuration first
-  const { trackingTable, folderNameField, tableName, geminiKeyCount } = validateConfig();
+  const { trackingTable, folderNameField, tableName, optimalWorkers } = validateConfig();
   
-  // Adjust worker count based on available API keys
-  const numWorkers = Math.min(MAX_WORKERS, Math.max(1, geminiKeyCount));
-  log(`Using ${numWorkers} workers (based on ${geminiKeyCount} available API keys)`);
+  // Use optimal worker count based on available keys
+  const numWorkers = optimalWorkers;
+  log(`Using ${numWorkers} workers based on available API keys and configuration`);
   
   try {
     // Fetch finished folders from Airtable

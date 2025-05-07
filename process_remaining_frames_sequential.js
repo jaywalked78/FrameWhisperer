@@ -65,10 +65,38 @@ function validateConfig() {
   }
   
   // Check for Gemini API key
-  if (!process.env.GEMINI_API_KEY) {
-    log('Error: GEMINI_API_KEY not set in .env file. Processing will likely fail.');
-    process.exit(1);
+  const apiKeys = {
+    GEMINI_API_KEY: process.env.GEMINI_API_KEY,
+    GOOGLE_API_KEY: process.env.GOOGLE_API_KEY
+  };
+  
+  // First check for dedicated GEMINI_API_KEY
+  if (apiKeys.GEMINI_API_KEY) {
+    log(`Found Gemini API key: ${apiKeys.GEMINI_API_KEY.substring(0, 10)}...`);
+  } 
+  // Then check for GOOGLE_API_KEY as fallback
+  else if (apiKeys.GOOGLE_API_KEY) {
+    log(`Found Google API key: ${apiKeys.GOOGLE_API_KEY.substring(0, 10)}...`);
+    // Export as GEMINI_API_KEY for compatibility with worker scripts
+    process.env.GEMINI_API_KEY = apiKeys.GOOGLE_API_KEY;
+    log(`Using Google API key as Gemini API key`);
+  } else {
+    log(`Warning: No API key found. Processing will attempt to continue with LLM processing anyway.`);
+    // OCR_ONLY_MODE is no longer used - full LLM processing will be attempted
   }
+  
+  // Check for preferred model configuration
+  if (process.env.GEMINI_PREFERRED_MODEL) {
+    log(`Using preferred Gemini model: ${process.env.GEMINI_PREFERRED_MODEL}`);
+  } else {
+    // Set default preferred model to Gemini 2.0 Flash experimental
+    process.env.GEMINI_PREFERRED_MODEL = 'models/gemini-2.0-flash-exp';
+    log(`Setting default preferred model to ${process.env.GEMINI_PREFERRED_MODEL}`);
+  }
+  
+  // Configure fallback models
+  process.env.GEMINI_FALLBACK_MODELS = process.env.GEMINI_FALLBACK_MODELS || 'models/gemini-2.0-flash,models/gemini-1.5-flash';
+  log(`Configured fallback models: ${process.env.GEMINI_FALLBACK_MODELS}`);
   
   const trackingTable = process.env.AIRTABLE_TRACKING_TABLE || 'Finished OCR Processed Folders';
   const folderNameField = process.env.FOLDER_NAME_FIELD || 'FolderName';
@@ -267,51 +295,46 @@ async function collectFrames(folders) {
   return { framesFile: REMAINING_FRAMES_FILE, totalFrames };
 }
 
-// Process a single frame
+// Process a single frame using worker script
 function processFrame(framePath, frameIndex, totalFrames, tableName) {
-  return new Promise((resolve) => {
-    log(`Processing frame ${frameIndex+1}/${totalFrames}: ${path.basename(framePath)}`);
+  log(`[${frameIndex}/${totalFrames}] Processing frame: ${path.basename(framePath)}`);
+  
+  return new Promise((resolve, reject) => {
+    // Create environment variables for worker process
+    const env = {
+      ...process.env,
+      AIRTABLE_TABLE_NAME: tableName,
+      PYTHONUNBUFFERED: '1'  // Ensure Python output is not buffered
+    };
     
-    // Create a temporary file containing just this one frame
-    const tempFrameFile = path.join(TEMP_DIR, `single_frame_${TIMESTAMP}.txt`);
-    fs.writeFileSync(tempFrameFile, framePath);
+    // Ensure OCR_ONLY_MODE is not passed to the worker
+    if (env.OCR_ONLY_MODE) {
+      log(`Note: OCR_ONLY_MODE setting will be ignored as this mode has been disabled.`);
+      delete env.OCR_ONLY_MODE;
+    }
     
-    // Build command with all necessary parameters
-    const workerCmd = 'node';
-    const workerArgs = [
-      'robust_ocr_worker.js',
-      `--frames-file=${tempFrameFile}`,
-      `--worker-id=1`, // Always use worker ID 1 for sequential
-      `--api-key=${process.env.AIRTABLE_PERSONAL_ACCESS_TOKEN}`,
-      `--base-id=${process.env.AIRTABLE_BASE_ID}`,
-      `--table-name=${tableName}`,
-      '--timeout=300',
-      '--max-retries=3',
-      '--sequential=true' // Add flag for sequential processing
-    ];
+    // Determine the appropriate Python command
+    const pythonCmd = getPythonCommand();
     
-    log(`Worker command: ${workerCmd} ${workerArgs.join(' ')}`);
-    
-    // No environment variables manipulations for API key rotation
-    // We just use whatever is in the environment
-    
-    // Start the process and capture output
-    const worker = spawn(workerCmd, workerArgs, {
-      stdio: 'pipe' // Capture output for performance analysis
-    });
+    // Run the worker script with timeout protection
+    const workerProcess = spawn(pythonCmd, [
+      'process_frames_by_path.py',
+      '--folder-path', framePath,
+      '--skip-airtable-update'
+    ], { env });
     
     let stdoutData = '';
     let stderrData = '';
     
-    worker.stdout.on('data', (data) => {
+    workerProcess.stdout.on('data', (data) => {
       stdoutData += data.toString();
     });
     
-    worker.stderr.on('data', (data) => {
+    workerProcess.stderr.on('data', (data) => {
       stderrData += data.toString();
     });
     
-    worker.on('close', (code) => {
+    workerProcess.on('close', (code) => {
       log(`Frame ${frameIndex+1}/${totalFrames} processed with exit code: ${code}`);
       
       // Log completion time
@@ -322,19 +345,20 @@ function processFrame(framePath, frameIndex, totalFrames, tableName) {
         }
       }
       
-      // Clean up temp file
-      try {
-        fs.unlinkSync(tempFrameFile);
-      } catch (error) {
-        log(`Warning: Could not delete temp file: ${error.message}`);
+      // Log model used if available
+      if (stdoutData.includes("Using model:")) {
+        const modelMatch = stdoutData.match(/Using model: ([^\s]+)/);
+        if (modelMatch) {
+          log(`Used model: ${modelMatch[1]}`);
+        }
       }
       
       resolve(code === 0);
     });
     
-    worker.on('error', (error) => {
+    workerProcess.on('error', (error) => {
       log(`Error processing frame ${frameIndex+1}/${totalFrames}: ${error.message}`);
-      resolve(false);
+      reject(error);
     });
   });
 }

@@ -2,6 +2,13 @@
 
 A comprehensive system for processing video frames with OCR and LLM analysis, designed to extract and analyze text from screenshots and images. This pipeline integrates seamlessly with Airtable for data management and utilizes Google's Gemini API for advanced text processing.
 
+## What's New in v1.1.0
+
+- **Improved Text Formatting**: Extracted text now has clear structure with categories and separators
+- **Better Performance**: Eliminated redundant API validation calls between frames
+- **Fixed GeminiProcessor**: Added missing method and improved error handling
+- **Removed OCR-Only Mode**: All processing now includes LLM analysis for better results
+
 ## Architecture
 
 The OCR Pipeline consists of several key components:
@@ -27,17 +34,28 @@ flowchart TD
 - **process_remaining_frames_reverse.js**: JavaScript processor for reverse-order frame processing
 - **robust_ocr_worker.js**: JavaScript worker for robust OCR processing with retries and error handling
 - **sequential_ocr_processor_Reverse.js**: Orchestrator for sequential OCR processing
+- **gemini_processor.py**: Python module for interacting with the Gemini API
 
 ### Runner Scripts
 
 - **run_ocr_pipeline.sh**: Main unified script that provides options for different processing modes
 - **run_sequential_ocr_Reverse_Webhook.sh**: Shell script to run the OCR pipeline with webhook notifications
-- **run_sequential_ocr_Reverse.sh**: Shell script for running sequential OCR without webhooks
+- **run_sequential_ocr_Reverse.sh**: Shell script for running sequential OCR
+
+### Testing and Utility Scripts
+
+- **test_ocr_formatting.py**: Demonstrates the new text formatting functionality
+- **test_gemini_api.py**: Tests the Gemini API connection and available models
+- **gemini_2_0_flash_example.py**: Example using Gemini 2.0 Flash models
 
 ## Features
 
 - **Intelligent Text Extraction**: Uses Tesseract OCR for initial text extraction
-- **LLM Enhancement**: Utilizes Google's Gemini AI to clean OCR results and extract meaningful text
+- **LLM Enhancement**: Utilizes Google's Gemini API to clean OCR results and extract meaningful text
+- **Structured Text Formatting**: 
+  - Organized text with clear category labels (App:, UI:, Menu:, etc.)
+  - Pipe separator symbols (|) between different UI elements and sections
+  - Easily parseable format for downstream processing
 - **Sensitive Information Detection**: Automatically flags frames containing sensitive information:
   - API keys (Google, AWS, Stripe, etc.)
   - Passwords and credentials
@@ -50,6 +68,7 @@ flowchart TD
 - **Webhook Notifications**: Notifies external systems (like n8n) when processing is complete
 - **API Key Rotation**: Supports rotation of API keys to avoid rate limits
 - **Error Handling**: Robust retry logic and error handling for maximum reliability
+- **Performance Optimization**: Caches API validation results to prevent redundant calls
 
 ## Processing Options
 
@@ -124,6 +143,13 @@ node process_remaining_frames_sequential.js
 node process_remaining_frames_reverse.js
 ```
 
+#### Testing Text Formatting
+
+Try the new text formatting functionality:
+```bash
+python test_ocr_formatting.py --image "/path/to/image.jpg"
+```
+
 ## Airtable Integration
 
 The system integrates with Airtable to store OCR results and metadata:
@@ -149,5 +175,6 @@ Key environment variables needed in the `.env` file:
 - `AIRTABLE_RATE_LIMIT_SLEEP`: Sleep time between Airtable API calls (default: 0.25s)
 - `GOOGLE_API_KEY`: Gemini API key
 - `GEMINI_API_KEY_1` through `GEMINI_API_KEY_5`: Additional Gemini API keys for rotation
+- `GEMINI_PREFERRED_MODEL`: Preferred Gemini model (default: models/gemini-2.0-flash-exp)
 - `BASE_DIR`: Base directory for screen recordings
 - `MAX_WORKERS`: Maximum number of concurrent workers for parallel processing 
